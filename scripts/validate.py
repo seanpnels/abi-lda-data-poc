@@ -25,7 +25,10 @@ with open(SRC,encoding='utf-8') as f:
  for line_num,line in enumerate(f,1):
   if not line.strip():continue
   try:
-   o=json.loads(line); props=o.get('properties') or {}; tags=props.get('tags') or {}
+   # RFC 8142 GeoJSON Text Sequences prefix each record with ASCII RS (0x1E).
+   record = line.lstrip('\x1e').strip()
+   if not record: continue
+   o=json.loads(record); props=o.get('properties') or {}; tags=props.get('tags') or {}
    # osmium export commonly flattens OSM tags directly into properties.
    if not tags: tags=props
    cats=[name for name,rule in category_rules.items() if rule(tags)]
@@ -44,6 +47,12 @@ with open(SRC,encoding='utf-8') as f:
   except Exception as e:
    counts['parse_errors']+=1
    if len(errors)<20:errors.append({'line':line_num,'error':str(e)})
+
+# Fail closed: a successful workflow must never report an empty census after parsing failures.
+if counts['parse_errors']:
+ raise RuntimeError(f"Validation rejected: {counts['parse_errors']} GeoJSON records could not be parsed. Examples: {errors[:3]}")
+if counts['total_candidate_features'] == 0:
+ raise RuntimeError('Validation rejected: zero restricted-facility candidates were classified.')
 
 def write_csv(path,rows,columns):
  with open(path,'w',newline='',encoding='utf-8') as f:
