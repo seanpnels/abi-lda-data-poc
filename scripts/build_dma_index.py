@@ -6,6 +6,11 @@ from pathlib import Path
 import requests
 import shapefile
 from shapely.geometry import shape, mapping
+from shapely.validation import explain_validity
+try:
+    from shapely import make_valid
+except ImportError:
+    from shapely.validation import make_valid
 
 DMA_URL = ('https://servicesdev.arcgis.com/f126c8da131543019b05e4bfab6fc6ac/'
            'ArcGIS/rest/services/Esri_Demographics_2025_Base_01_gdb/FeatureServer/2/query')
@@ -64,7 +69,32 @@ for f in features:
     p=f.get('properties') or {}; code=str(p.get('ID','')).strip(); name=str(p.get('name','')).strip()
     if not code or not name or code in ids: raise RuntimeError('Invalid/duplicate DMA')
     g=shape(f['geometry'])
-    if g.is_empty or not g.is_valid: raise RuntimeError(f'Invalid DMA polygon: {name}')
+    if g.is_empty:
+        raise RuntimeError(f'Empty DMA geometry: {name}')
+    if not g.is_valid:
+        original_area = g.area
+        reason = explain_validity(g)
+        repaired = make_valid(g)
+        # make_valid can yield a GeometryCollection; retain polygonal pieces only.
+        if repaired.geom_type == 'GeometryCollection':
+            from shapely.geometry import MultiPolygon
+            polygons = []
+            for part in repaired.geoms:
+                if part.geom_type == 'Polygon':
+                    polygons.append(part)
+                elif part.geom_type == 'MultiPolygon':
+                    polygons.extend(part.geoms)
+            if not polygons:
+                raise RuntimeError(f'No polygonal geometry after repairing {name}: {reason}')
+            repaired = MultiPolygon(polygons) if len(polygons) > 1 else polygons[0]
+        if repaired.geom_type not in ('Polygon', 'MultiPolygon') or repaired.is_empty or not repaired.is_valid:
+            raise RuntimeError(f'Unrepairable DMA polygon: {name}: {reason}')
+        # Large area changes require inspection rather than automatic acceptance.
+        area_change = abs(repaired.area - original_area) / max(original_area, 1e-12)
+        if area_change > 0.001:
+            raise RuntimeError(f'DMA repair changed area too much ({area_change:.3%}): {name}: {reason}')
+        print(f'Repaired DMA geometry: {name}; issue={reason}; area_change={area_change:.5%}', flush=True)
+        g = repaired
     ids.add(code); dma.append({'type':'Feature','properties':{'id':code,'name':name},'geometry':mapping(g)})
 resp=s.get(CENSUS_URL,timeout=180);resp.raise_for_status()
 z=zipfile.ZipFile(io.BytesIO(resp.content)); shp=next(n for n in z.namelist() if n.endswith('.shp')); root=shp[:-4]
