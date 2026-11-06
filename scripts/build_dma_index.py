@@ -5,7 +5,8 @@ import io, json, zipfile
 from pathlib import Path
 import requests
 import shapefile
-from shapely.geometry import shape, mapping
+from shapely.geometry import shape, mapping, GeometryCollection, MultiPolygon
+from shapely.ops import unary_union
 from shapely.validation import explain_validity
 try:
     from shapely import make_valid
@@ -64,38 +65,72 @@ for offset in range(0, len(object_ids), 20):
 
 if len(features) != 209:
     raise RuntimeError(f"Expected exactly 209 DMAs; got {len(features)}")
-ids=set(); dma=[]
+def polygonal_only(geometry):
+    """Retain only polygon pieces from a repair, without silently losing them."""
+    if geometry.geom_type in ('Polygon', 'MultiPolygon'):
+        return geometry
+    if geometry.geom_type == 'GeometryCollection':
+        parts = []
+        for child in geometry.geoms:
+            if child.geom_type == 'Polygon':
+                parts.append(child)
+            elif child.geom_type == 'MultiPolygon':
+                parts.extend(child.geoms)
+        return unary_union(parts) if parts else GeometryCollection()
+    return GeometryCollection()
+
+
+ids=set(); dma=[]; problems=[]
 for f in features:
     p=f.get('properties') or {}; code=str(p.get('ID','')).strip(); name=str(p.get('name','')).strip()
     if not code or not name or code in ids: raise RuntimeError('Invalid/duplicate DMA')
+    ids.add(code)
     g=shape(f['geometry'])
     if g.is_empty:
-        raise RuntimeError(f'Empty DMA geometry: {name}')
+        problems.append({'id':code,'name':name,'issue':'empty geometry'})
+        continue
     if not g.is_valid:
-        original_area = g.area
-        reason = explain_validity(g)
-        repaired = make_valid(g)
-        # make_valid can yield a GeometryCollection; retain polygonal pieces only.
-        if repaired.geom_type == 'GeometryCollection':
-            from shapely.geometry import MultiPolygon
-            polygons = []
-            for part in repaired.geoms:
-                if part.geom_type == 'Polygon':
-                    polygons.append(part)
-                elif part.geom_type == 'MultiPolygon':
-                    polygons.extend(part.geoms)
-            if not polygons:
-                raise RuntimeError(f'No polygonal geometry after repairing {name}: {reason}')
-            repaired = MultiPolygon(polygons) if len(polygons) > 1 else polygons[0]
-        if repaired.geom_type not in ('Polygon', 'MultiPolygon') or repaired.is_empty or not repaired.is_valid:
-            raise RuntimeError(f'Unrepairable DMA polygon: {name}: {reason}')
-        # Large area changes require inspection rather than automatic acceptance.
-        area_change = abs(repaired.area - original_area) / max(original_area, 1e-12)
-        if area_change > 0.001:
-            raise RuntimeError(f'DMA repair changed area too much ({area_change:.3%}): {name}: {reason}')
-        print(f'Repaired DMA geometry: {name}; issue={reason}; area_change={area_change:.5%}', flush=True)
-        g = repaired
-    ids.add(code); dma.append({'type':'Feature','properties':{'id':code,'name':name},'geometry':mapping(g)})
+        reason=explain_validity(g)
+        candidates={}
+        for method, fn in [('make_valid',make_valid),('buffer_zero',lambda x:x.buffer(0))]:
+            try:
+                candidate=polygonal_only(fn(g))
+                if candidate.is_empty or not candidate.is_valid or candidate.geom_type not in ('Polygon','MultiPolygon'):
+                    candidates[method]={'valid':False,'type':candidate.geom_type}
+                else:
+                    area_delta=abs(candidate.area-g.area)/max(g.area,1e-12)
+                    candidates[method]={'valid':True,'area_change_pct':round(area_delta*100,6),
+                                        'area_degrees_squared':candidate.area,
+                                        'parts':len(candidate.geoms) if candidate.geom_type=='MultiPolygon' else 1}
+            except Exception as exc:
+                candidates[method]={'error':str(exc)}
+        diagnostic={'id':code,'name':name,'issue':reason,'original_type':g.geom_type,
+                    'original_area_degrees_squared':g.area,
+                    'original_parts':len(g.geoms) if g.geom_type=='MultiPolygon' else 1,
+                    'candidate_repairs':candidates}
+        print('DMA_GEOMETRY_DIAGNOSTIC '+json.dumps(diagnostic),flush=True)
+        repaired=polygonal_only(make_valid(g))
+        change=abs(repaired.area-g.area)/max(g.area,1e-12) if not repaired.is_empty else float('inf')
+        if repaired.is_empty or not repaired.is_valid or change>0.001:
+            problems.append(diagnostic)
+            # Export source and proposed repairs for independent visual inspection.
+            (OUT/f'dma-problem-{code}.geojson').write_text(json.dumps({
+                'type':'FeatureCollection','features':[
+                    {'type':'Feature','properties':{'variant':'source','id':code,'name':name},'geometry':mapping(g)},
+                    {'type':'Feature','properties':{'variant':'make_valid','id':code,'name':name},'geometry':mapping(repaired)}
+                ]}))
+            continue
+        print(f'Repaired DMA geometry: {name}; issue={reason}; area_change={change:.5%}',flush=True)
+        g=repaired
+    dma.append({'type':'Feature','properties':{'id':code,'name':name},'geometry':mapping(g)})
+
+if problems:
+    (OUT/'dma-geometry-diagnostics.json').write_text(json.dumps(problems,indent=2))
+    print(f'GEOMETRY VALIDATION FAILED: {len(problems)} DMA(s) require review; '+
+          'diagnostic GeoJSON and JSON written to work/.',flush=True)
+    raise RuntimeError(f'{len(problems)} DMA geometries need review; see DMA_GEOMETRY_DIAGNOSTIC log entries')
+if len(dma)!=209:
+    raise RuntimeError(f'Expected 209 validated DMAs; got {len(dma)}')
 resp=s.get(CENSUS_URL,timeout=180);resp.raise_for_status()
 z=zipfile.ZipFile(io.BytesIO(resp.content)); shp=next(n for n in z.namelist() if n.endswith('.shp')); root=shp[:-4]
 reader=shapefile.Reader(shp=io.BytesIO(z.read(root+'.shp')),
