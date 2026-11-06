@@ -110,6 +110,28 @@ for f in features:
                     'candidate_repairs':candidates}
         print('DMA_GEOMETRY_DIAGNOSTIC '+json.dumps(diagnostic),flush=True)
         repaired=polygonal_only(make_valid(g))
+        # ArcGIS sometimes encodes an entire polygon inside another member of
+        # a MultiPolygon. The invalid source then double-counts that region.
+        # For nested shells ONLY, union individually valid polygon members;
+        # this preserves the actual covered area rather than treating the
+        # inner member as a hole or trusting the double-counted source area.
+        if reason.startswith('Nested shells') and g.geom_type == 'MultiPolygon':
+            parts=list(g.geoms)
+            if all(part.is_valid and not part.is_empty for part in parts):
+                unioned=unary_union(parts)
+                if unioned.geom_type in ('Polygon','MultiPolygon') and unioned.is_valid and not unioned.is_empty:
+                    # Verify union matches the coverage of a zero-width buffer
+                    # (independent GEOS union/repair operation) within tolerance.
+                    buffered=polygonal_only(g.buffer(0))
+                    mismatch=unioned.symmetric_difference(buffered).area / max(unioned.area,1e-12)
+                    if buffered.is_valid and mismatch < 1e-8:
+                        print(f'Repaired nested shells via polygon union: {name}; '
+                              f'original_parts={len(parts)}; '
+                              f'union_parts={len(unioned.geoms) if unioned.geom_type=="MultiPolygon" else 1}; '
+                              f'coverage_mismatch={mismatch:.3%}',flush=True)
+                        g=unioned
+                        dma.append({'type':'Feature','properties':{'id':code,'name':name},'geometry':mapping(g)})
+                        continue
         change=abs(repaired.area-g.area)/max(g.area,1e-12) if not repaired.is_empty else float('inf')
         if repaired.is_empty or not repaired.is_valid or change>0.001:
             problems.append(diagnostic)
