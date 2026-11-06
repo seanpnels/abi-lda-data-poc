@@ -26,7 +26,7 @@ with SRC.open('r',encoding='utf-8') as fh:
         line=line.strip().lstrip('\x1e')
         if not line: continue
         try:
-            d=json.loads(line); tags=d.get('properties',{}).get('tags') or {}; cats=categories(tags)
+            d=json.loads(line); props=d.get('properties') or {}; tags=props.get('tags') or props; cats=categories(tags)
             if not cats or not d.get('geometry'): continue
             geom=shape(d['geometry'])
             if geom.is_empty: continue
@@ -36,7 +36,7 @@ with SRC.open('r',encoding='utf-8') as fh:
             if g.geom_type in ('Polygon','MultiPolygon'): quality='mapped_polygon_not_verified_building'
             elif g.geom_type=='Point': quality='point_only_no_footprint'
             else: quality='line_or_other_not_verified_building'
-            f={'id':str(d.get('properties',{}).get('@id',d.get('id',''))),'name':tags.get('name',''),'categories':cats,'geometry':g,'quality':quality}
+            f={'id':str(props.get('@id',props.get('id',d.get('id','')))),'name':tags.get('name',''),'categories':cats,'geometry':g,'quality':quality}
             features.append(f); counts[quality]+=1
         except Exception as exc:
             errors+=1
