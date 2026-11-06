@@ -159,18 +159,30 @@ reader=shapefile.Reader(shp=io.BytesIO(z.read(root+'.shp')),
                         shx=io.BytesIO(z.read(root+'.shx')),
                         dbf=io.BytesIO(z.read(root+'.dbf')))
 fields=[x[0] for x in reader.fields[1:]]
-# Geofabrik US state extracts are available for 50 states and DC. Exclude territories.
-exclude={'Puerto Rico','Guam','American Samoa','Northern Mariana Islands','United States Virgin Islands'}
+# Select the 50 states and DC by stable Census postal codes. Territory
+# display names vary (for example, the Virgin Islands name), so a name
+# exclusion list can accidentally retain an extra record.
+expected_states=set('AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY'.split())
+seen_states=set()
 states=[]
 for item in reader.iterShapeRecords():
     p=dict(zip(fields,item.record)); name=str(p['NAME'])
-    if name in exclude:continue
+    postal=str(p['STUSPS']).strip().upper()
+    if postal not in expected_states:
+        print(f'Excluded Census territory: {name} ({postal})',flush=True)
+        continue
+    if postal in seen_states:
+        raise RuntimeError(f'Duplicate Census state: {name} ({postal})')
+    seen_states.add(postal)
     g=shape(item.shape.__geo_interface__)
     if not g.is_valid:g=g.buffer(0)
-    if g.is_empty:continue
+    if g.is_empty or not g.is_valid:
+        raise RuntimeError(f'Invalid Census state geometry: {name} ({postal})')
     states.append({'type':'Feature','properties':{'name':name,'slug':name.lower().replace(' ','-')},
                    'geometry':mapping(g.simplify(.003,preserve_topology=True))})
-if len(states)!=51:raise RuntimeError(f'Expected 50 states + DC, got {len(states)}')
+if seen_states != expected_states or len(states)!=51:
+    raise RuntimeError(f'Expected 50 states + DC; got {len(states)}; '
+                       f'missing={sorted(expected_states-seen_states)}')
 index={'schema_version':1,'dma_source':DMA_URL,'state_source':CENSUS_URL,
        'dma':{'type':'FeatureCollection','features':dma},
        'states':{'type':'FeatureCollection','features':states}}
