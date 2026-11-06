@@ -1,0 +1,60 @@
+name: NYC OSM daily screening dataset - Stage 5
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 10 * * *'  # 10:00 UTC daily; GitHub schedule can be delayed
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install osmium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y osmium-tool
+      - name: Download current New York extract
+        run: |
+          mkdir -p work
+          curl --fail --location --retry 3 --retry-delay 15 --connect-timeout 30 -o work/new-york.osm.pbf https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf
+          test -s work/new-york.osm.pbf
+          osmium fileinfo -e work/new-york.osm.pbf > work/source-info.txt
+      - name: Extract facility candidates
+        run: |
+          osmium tags-filter work/new-york.osm.pbf \
+            nwr/amenity=school,kindergarten,childcare,place_of_worship,college,university \
+            nwr/building=school,kindergarten,church,chapel,mosque,synagogue,temple,college,university \
+            nwr/social_facility=drug_addiction,alcohol_addiction \
+            -o work/candidates.osm.pbf --overwrite
+          osmium export work/candidates.osm.pbf -f geojsonseq -o work/candidates.geojsonseq --overwrite
+          gzip -c work/candidates.geojsonseq > work/nyc-facilities.geojsonseq.gz
+      - name: Validate dataset before publishing
+        run: python scripts/check_dataset.py work/nyc-facilities.geojsonseq.gz
+      - name: Write dataset manifest
+        run: |
+          python - <<'PY'
+          import json,datetime,subprocess,os
+          def osm(key):
+              p=subprocess.run(['osmium','fileinfo','-g',key,'work/new-york.osm.pbf'],capture_output=True,text=True)
+              return p.stdout.strip() if p.returncode==0 else ''
+          manifest={'schema_version':1,'region':'New York State OSM candidate dataset; Stage 5 screening limited to NYC','generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'osm_timestamp':osm('header.option.timestamp'),'osm_replication_timestamp':osm('header.option.osmosis_replication_timestamp'),'github_run_id':os.environ.get('GITHUB_RUN_ID'),'file':'nyc-facilities.geojsonseq.gz','caveats':['OSM coverage incomplete','Candidate polygons not verified as building footprints','Human review required']}
+          with open('work/manifest.json','w') as f:json.dump(manifest,f,indent=2)
+          PY
+      - name: Publish immutable private release snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="nyc-osm-${GITHUB_RUN_ID}"
+          gh release create "$TAG" work/nyc-facilities.geojsonseq.gz work/manifest.json work/source-info.txt \
+            --title "NYC OSM candidate snapshot ${GITHUB_RUN_ID}" \
+            --notes "Stage 5 review-only OSM candidate dataset; not compliance-certified." \
+            --latest
+      - name: Upload diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage5-osm-build-diagnostics
+          path: work/source-info.txt
+          retention-days: 7
