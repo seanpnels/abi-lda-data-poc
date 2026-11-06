@@ -1,0 +1,20 @@
+name: Stage 6 - Build 209 DMA and state index
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests shapely pyproj pyshp
+      - run: python scripts/build_dma_index.py
+      - name: Publish versioned index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "stage6-index-${GITHUB_RUN_ID}" work/dma-state-index.json \
+            --title "Stage 6 DMA + state index ${GITHUB_RUN_ID}" \
+            --notes "209 Esri DMAs and 51 Census state geometries; review-only" --latest=false

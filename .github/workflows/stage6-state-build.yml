@@ -1,0 +1,110 @@
+name: Stage 6 - Nationwide state dataset batch
+on:
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: "Choose batch 0-6; run all seven batches once to attempt all 51 states"
+        required: true
+        type: choice
+        options: ['0','1','2','3','4','5','6']
+  schedule:
+    - cron: '15 9 * * 0'
+    - cron: '15 9 * * 1'
+    - cron: '15 9 * * 2'
+    - cron: '15 9 * * 3'
+    - cron: '15 9 * * 4'
+    - cron: '15 9 * * 5'
+    - cron: '15 9 * * 6'
+permissions:
+  contents: write
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      states: ${{ steps.batch.outputs.states }}
+    steps:
+      - id: batch
+        env:
+          EVENT: ${{ github.event_name }}
+          BATCH: ${{ inputs.batch }}
+          CRON: ${{ github.event.schedule }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os,json
+          states='alabama alaska arizona arkansas california colorado connecticut delaware district-of-columbia florida georgia hawaii idaho illinois indiana iowa kansas kentucky louisiana maine maryland massachusetts michigan minnesota mississippi missouri montana nebraska nevada new-hampshire new-jersey new-mexico new-york north-carolina north-dakota ohio oklahoma oregon pennsylvania rhode-island south-carolina south-dakota tennessee texas utah vermont virginia washington west-virginia wisconsin wyoming'.split()
+          if os.getenv('EVENT')=='schedule':
+              day=int(os.environ['CRON'].split()[-1]); batch=day
+          else:batch=int(os.environ['BATCH'])
+          selected=states[batch*8:(batch+1)*8]
+          if not selected:raise RuntimeError('Empty batch')
+          print('states='+json.dumps(selected))
+          PY
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        state: ${{ fromJSON(needs.prepare.outputs.states) }}
+    concurrency:
+      group: stage6-${{ matrix.state }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install osmium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y osmium-tool
+      - name: Download and extract state
+        env:
+          STATE: ${{ matrix.state }}
+        run: |
+          mkdir -p work
+          curl --fail --location --retry 4 --retry-delay 20 --connect-timeout 30 \
+            -o work/state.osm.pbf "https://download.geofabrik.de/north-america/us/${STATE}-latest.osm.pbf"
+          test -s work/state.osm.pbf
+          osmium fileinfo -e work/state.osm.pbf > work/source-info.txt
+          osmium tags-filter work/state.osm.pbf \
+            nwr/amenity=school,kindergarten,childcare,place_of_worship,college,university \
+            nwr/building=school,kindergarten,church,chapel,mosque,synagogue,temple,college,university \
+            nwr/social_facility=drug_addiction,alcohol_addiction \
+            -o work/candidates.osm.pbf --overwrite
+          osmium export work/candidates.osm.pbf -f geojsonseq -o work/candidates.geojsonseq --overwrite
+          gzip -c work/candidates.geojsonseq > work/facilities.geojsonseq.gz
+      - name: Validate and write manifest
+        env:
+          STATE: ${{ matrix.state }}
+        run: |
+          python scripts/validate_state.py work/facilities.geojsonseq.gz 100 > work/validation.json
+          python - <<'PY'
+          import os,json,datetime,hashlib,subprocess
+          p='work/facilities.geojsonseq.gz'
+          ts=subprocess.run(['osmium','fileinfo','-g','header.option.timestamp','work/state.osm.pbf'],capture_output=True,text=True)
+          manifest={'schema_version':2,'state':os.environ['STATE'],
+            'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'osm_timestamp':ts.stdout.strip(),
+            'sha256':hashlib.sha256(open(p,'rb').read()).hexdigest(),
+            'github_run_id':os.environ['GITHUB_RUN_ID'],
+            'caveats':['Incomplete OSM coverage','Unverified footprints','Human review mandatory']}
+          open('work/manifest.json','w').write(json.dumps(manifest,indent=2))
+          PY
+      - name: Publish immutable validated snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ matrix.state }}
+        run: |
+          gh release create "stage6-osm-${STATE}-${GITHUB_RUN_ID}" \
+            work/facilities.geojsonseq.gz work/manifest.json work/source-info.txt work/validation.json \
+            --title "Stage 6 ${STATE} snapshot ${GITHUB_RUN_ID}" \
+            --notes "Review-only OSM candidates; not compliance certification" --latest=false
+      - name: Diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage6-${{ matrix.state }}-${{ github.run_id }}
+          path: |
+            work/source-info.txt
+            work/validation.json
+          retention-days: 7
