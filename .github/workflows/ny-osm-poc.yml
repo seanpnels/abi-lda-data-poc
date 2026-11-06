@@ -1,0 +1,44 @@
+name: NYC OSM facility extraction POC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install osmium-tool
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y osmium-tool
+      - name: Download New York OSM extract
+        run: |
+          mkdir -p work output
+          curl --fail --location --retry 3 --retry-delay 15 --connect-timeout 30 \
+            --output work/new-york.osm.pbf \
+            https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf
+          test -s work/new-york.osm.pbf
+          osmium fileinfo -e work/new-york.osm.pbf > output/source-info.txt
+      - name: Extract potentially restricted features and their geometry dependencies
+        run: |
+          osmium tags-filter work/new-york.osm.pbf \
+            nwr/amenity=school,kindergarten,childcare,place_of_worship,college,university \
+            nwr/building=school,kindergarten,church,chapel,mosque,synagogue,temple,college,university \
+            nwr/social_facility=drug_addiction,alcohol_addiction \
+            nwr/healthcare=speciality \
+            -o work/candidates.osm.pbf --overwrite
+          osmium fileinfo -e work/candidates.osm.pbf > output/candidates-info.txt
+          python scripts/manifest.py output work/candidates.osm.pbf
+      - name: Upload output for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: ny-osm-facility-candidates
+          path: |
+            output/
+            work/candidates.osm.pbf
+          retention-days: 7
