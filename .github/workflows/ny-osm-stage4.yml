@@ -1,0 +1,39 @@
+name: NYC OSM real placement screening POC - Stage 4
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y osmium-tool
+          python -m pip install 'shapely>=2,<3' 'pyproj>=3,<4'
+      - name: Download New York OSM extract
+        run: |
+          mkdir -p work output/stage4
+          curl --fail --location --retry 3 --retry-delay 15 --connect-timeout 30 -o work/new-york.osm.pbf https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf
+          test -s work/new-york.osm.pbf
+          osmium fileinfo -e work/new-york.osm.pbf > output/stage4/source-info.txt
+      - name: Extract restricted facility candidates
+        run: |
+          osmium tags-filter work/new-york.osm.pbf \
+            nwr/amenity=school,kindergarten,childcare,place_of_worship,college,university \
+            nwr/building=school,kindergarten,church,chapel,mosque,synagogue,temple,college,university \
+            nwr/social_facility=drug_addiction,alcohol_addiction \
+            -o work/candidates.osm.pbf --overwrite
+          osmium export work/candidates.osm.pbf -f geojsonseq -o work/candidates.geojsonseq --overwrite
+      - name: Screen LinkNYC inventory at 250 feet
+        run: python scripts/screen_real_poc.py work/candidates.geojsonseq inputs/links_stage4.csv output/stage4
+      - name: Upload diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ny-osm-stage4-linknyc-250ft
+          path: output/stage4/
+          retention-days: 7
