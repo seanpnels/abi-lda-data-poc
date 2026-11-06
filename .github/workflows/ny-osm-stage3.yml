@@ -1,0 +1,39 @@
+name: NYC OSM synthetic screening POC - Stage 3
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y osmium-tool
+          python -m pip install 'shapely>=2,<3' 'pyproj>=3,<4'
+      - name: Download New York OSM source
+        run: |
+          mkdir -p work output/stage3
+          curl --fail --location --retry 3 --retry-delay 15 --connect-timeout 30 -o work/new-york.osm.pbf https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf
+          test -s work/new-york.osm.pbf
+          osmium fileinfo -e work/new-york.osm.pbf > output/stage3/source-info.txt
+      - name: Extract facility candidates and geometry dependencies
+        run: |
+          osmium tags-filter work/new-york.osm.pbf \
+            nwr/amenity=school,kindergarten,childcare,place_of_worship,college,university \
+            nwr/building=school,kindergarten,church,chapel,mosque,synagogue,temple,college,university \
+            nwr/social_facility=drug_addiction,alcohol_addiction \
+            -o work/candidates.osm.pbf --overwrite
+          osmium export work/candidates.osm.pbf -f geojsonseq -o work/candidates.geojsonseq --overwrite
+      - name: Run synthetic screening and write audit report
+        run: python scripts/screen_poc.py work/candidates.geojsonseq output/stage3
+      - name: Upload diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ny-osm-stage3-synthetic-screening
+          path: output/stage3/
+          retention-days: 14
