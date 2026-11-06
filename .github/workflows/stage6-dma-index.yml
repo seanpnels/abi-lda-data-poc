@@ -11,6 +11,16 @@ jobs:
       - uses: actions/checkout@v4
       - run: pip install requests shapely pyproj pyshp
       - run: python scripts/build_dma_index.py
+      - name: Upload DMA geometry diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage6-dma-geometry-diagnostics
+          path: |
+            work/dma-geometry-diagnostics.json
+            work/dma-problem-*.geojson
+          if-no-files-found: warn
+          retention-days: 14
       - name: Publish versioned index
         env:
           GH_TOKEN: ${{ github.token }}
