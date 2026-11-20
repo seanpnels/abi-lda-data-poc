@@ -1,53 +1,166 @@
-name: Stage 6 - Nationwide state dataset batch
+name: Stage 6 - State OSM Facility Build
+
 on:
   workflow_dispatch:
     inputs:
       batch:
-        description: "Choose batch 0-6; run all seven batches once to attempt all 51 states"
+        description: 'State batch (0–6, eight states per batch)'
         required: true
+        default: '0'
         type: choice
-        options: ['0','1','2','3','4','5','6']
+        options: ['0', '1', '2', '3', '4', '5', '6']
+  # One batch per day. Verify these times match your previous workflow schedule.
   schedule:
-    - cron: '15 9 * * 0'
-    - cron: '15 9 * * 1'
-    - cron: '15 9 * * 2'
-    - cron: '15 9 * * 3'
-    - cron: '15 9 * * 4'
-    - cron: '15 9 * * 5'
-    - cron: '15 9 * * 6'
+    - cron: '17 6 * * 0'
+    - cron: '17 6 * * 1'
+    - cron: '17 6 * * 2'
+    - cron: '17 6 * * 3'
+    - cron: '17 6 * * 4'
+    - cron: '17 6 * * 5'
+    - cron: '17 6 * * 6'
+
 permissions:
   contents: write
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       states: ${{ steps.batch.outputs.states }}
+      has_changes: ${{ steps.batch.outputs.has_changes }}
     steps:
-      - id: batch
+      - name: Compare Geofabrik checksums with successful snapshots
+        id: batch
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           BATCH: ${{ inputs.batch }}
           CRON: ${{ github.event.schedule }}
         run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import os,json
-          states='alabama alaska arizona arkansas california colorado connecticut delaware district-of-columbia florida georgia hawaii idaho illinois indiana iowa kansas kentucky louisiana maine maryland massachusetts michigan minnesota mississippi missouri montana nebraska nevada new-hampshire new-jersey new-mexico new-york north-carolina north-dakota ohio oklahoma oregon pennsylvania rhode-island south-carolina south-dakota tennessee texas utah vermont virginia washington west-virginia wisconsin wyoming'.split()
-          if os.getenv('EVENT')=='schedule':
-              day=int(os.environ['CRON'].split()[-1]); batch=day
-          else:batch=int(os.environ['BATCH'])
-          selected=states[batch*8:(batch+1)*8]
-          if not selected:raise RuntimeError('Empty batch')
-          print('states='+json.dumps(selected))
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import tempfile
+          import urllib.request
+
+          states = (
+              'alabama alaska arizona arkansas california colorado connecticut '
+              'delaware district-of-columbia florida georgia hawaii idaho illinois '
+              'indiana iowa kansas kentucky louisiana maine maryland massachusetts '
+              'michigan minnesota mississippi missouri montana nebraska nevada '
+              'new-hampshire new-jersey new-mexico new-york north-carolina '
+              'north-dakota ohio oklahoma oregon pennsylvania rhode-island '
+              'south-carolina south-dakota tennessee texas utah vermont virginia '
+              'washington west-virginia wisconsin wyoming'
+          ).split()
+
+          if os.environ['EVENT'] == 'schedule':
+              batch = int(os.environ['CRON'].split()[-1])
+          else:
+              batch = int(os.environ['BATCH'])
+
+          selected = states[batch * 8:(batch + 1) * 8]
+          if not selected:
+              raise RuntimeError(f'Empty batch: {batch}')
+
+          # Release listings are limited. If a previous snapshot is not found,
+          # the next successful build establishes a baseline for this state.
+          releases = json.loads(subprocess.check_output(
+              ['gh', 'release', 'list', '--limit', '1000',
+               '--json', 'tagName,createdAt'], text=True
+          ))
+
+          pending = []
+          deferred = []
+          skipped = []
+
+          for state in selected:
+              print(f'Checking {state}', flush=True)
+              url = (
+                  'https://download.geofabrik.de/north-america/us/'
+                  f'{state}/{state}-latest.osm.pbf.md5'
+              )
+              try:
+                  req = urllib.request.Request(
+                      url, headers={'User-Agent': 'ABI-OOH-OSM-Refresh/1.0'}
+                  )
+                  with urllib.request.urlopen(req, timeout=25) as response:
+                      raw = response.read(512).decode('ascii').strip()
+                  match = re.match(r'^([a-fA-F0-9]{32})\b', raw)
+                  if not match:
+                      raise ValueError('Invalid MD5 response')
+                  source_md5 = match.group(1).lower()
+              except Exception as exc:
+                  print(f'DEFERRED {state}: checksum unavailable: {exc}', flush=True)
+                  deferred.append(state)
+                  continue
+
+              prefix = f'stage6-osm-{state}-'
+              matching = [r for r in releases if r['tagName'].startswith(prefix)]
+              previous_md5 = None
+              if matching:
+                  latest = max(matching, key=lambda r: r['createdAt'])
+                  tag = latest['tagName']
+                  try:
+                      with tempfile.TemporaryDirectory() as directory:
+                          subprocess.run(
+                              ['gh', 'release', 'download', tag,
+                               '--pattern', 'manifest.json', '--dir', directory],
+                              check=True, text=True, capture_output=True
+                          )
+                          manifest = json.loads(
+                              (pathlib.Path(directory) / 'manifest.json').read_text()
+                          )
+                          if manifest.get('state') != state:
+                              raise ValueError('Snapshot state mismatch')
+                          previous_md5 = manifest.get('source_md5')
+                  except Exception as exc:
+                      # Do not overwrite or silently replace an existing snapshot
+                      # when we cannot inspect its manifest.
+                      print(f'DEFERRED {state}: cannot inspect previous snapshot: {exc}', flush=True)
+                      deferred.append(state)
+                      continue
+
+              if previous_md5 and previous_md5.lower() == source_md5:
+                  print(f'SKIP {state}: source unchanged', flush=True)
+                  skipped.append(state)
+              else:
+                  print(f'UPDATE {state}: changed or missing checksum baseline', flush=True)
+                  pending.append({'state': state, 'source_md5': source_md5})
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('states=' + json.dumps(pending), file=output)
+              print('has_changes=' + str(bool(pending)).lower(), file=output)
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'### Stage 6 OSM batch {batch}\n\n')
+              summary.write(f'- Updates to build: **{len(pending)}**\n')
+              summary.write(f'- Unchanged states: **{len(skipped)}**\n')
+              summary.write(f'- Deferred checks: **{len(deferred)}**\n')
+              if deferred:
+                  summary.write('\n**Deferred:** ' + ', '.join(deferred) + '\n')
+
+          print('Selected updates:', json.dumps(pending), flush=True)
+          if deferred:
+              print('WARNING: Deferred states will retain existing snapshots.', flush=True)
           PY
+
   build:
     needs: prepare
+    if: needs.prepare.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
-        state: ${{ fromJSON(needs.prepare.outputs.states) }}
+        include: ${{ fromJSON(needs.prepare.outputs.states) }}
     concurrency:
       group: stage6-${{ matrix.state }}
       cancel-in-progress: false
@@ -60,11 +173,13 @@ jobs:
       - name: Download and extract state
         env:
           STATE: ${{ matrix.state }}
+          EXPECTED_MD5: ${{ matrix.source_md5 }}
         run: |
           mkdir -p work
           curl --fail --location --retry 5 --retry-connrefused --retry-delay 30 --connect-timeout 30 \
-           -o work/state.osm.pbf "https://download.geofabrik.de/north-america/us/${STATE}/${STATE}-latest.osm.pbf"
+            -o work/state.osm.pbf "https://download.geofabrik.de/north-america/us/${STATE}/${STATE}-latest.osm.pbf"
           test -s work/state.osm.pbf
+          echo "${EXPECTED_MD5}  work/state.osm.pbf" | md5sum --check --status
           osmium fileinfo -e work/state.osm.pbf > work/source-info.txt
           osmium tags-filter work/state.osm.pbf \
             nwr/amenity=school,kindergarten,childcare,place_of_worship,college,university \
@@ -76,6 +191,7 @@ jobs:
       - name: Validate and write manifest
         env:
           STATE: ${{ matrix.state }}
+          EXPECTED_MD5: ${{ matrix.source_md5 }}
         run: |
           python scripts/validate_state.py work/facilities.geojsonseq.gz 100 > work/validation.json
           python - <<'PY'
@@ -83,6 +199,7 @@ jobs:
           p='work/facilities.geojsonseq.gz'
           ts=subprocess.run(['osmium','fileinfo','-g','header.option.timestamp','work/state.osm.pbf'],capture_output=True,text=True)
           manifest={'schema_version':2,'state':os.environ['STATE'],
+            'source_md5':os.environ['EXPECTED_MD5'],
             'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'osm_timestamp':ts.stdout.strip(),
             'sha256':hashlib.sha256(open(p,'rb').read()).hexdigest(),
