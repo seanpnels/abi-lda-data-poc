@@ -63,7 +63,7 @@ jobs:
         run: |
           mkdir -p work
           curl --fail --location --retry 4 --retry-delay 20 --connect-timeout 30 \
-            -o work/state.osm.pbf "https://download.geofabrik.de/north-america/us/${STATE}-latest.osm.pbf"
+           -o work/state.osm.pbf "https://download.geofabrik.de/north-america/us/${STATE}/${STATE}-latest.osm.pbf"
           test -s work/state.osm.pbf
           osmium fileinfo -e work/state.osm.pbf > work/source-info.txt
           osmium tags-filter work/state.osm.pbf \
